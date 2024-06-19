@@ -1,0 +1,166 @@
+---
+title: "1 - Data Curation"
+author: "Benjamin Dupuis"
+format:
+  html: 
+    df-print: paged
+editor: visual
+theme:
+  light: flatly
+  dark: darkly
+knitr:
+  opts_knit:
+    root.dir: "/media/bdupuis/1091_PhD_BD/Research projects/tdr2nrj/"
+---
+
+```{r}
+#| label: preambule
+#| echo: false
+#| include: false
+
+rm(list=ls())
+gc()
+
+options("sp_evolution_status"=2) #for rgal retirement
+
+library(tidyverse);library(scattermore);library(viridis) 
+library(ggpubr); library(cowplot) ; library(data.table)
+library(lubridate); library(zoo); library(tools)
+
+if(Sys.info()["sysname"] == "Linux"){
+  my_root <- "/media/bdupuis/1091_PhD_BD/"
+}else{ my_root <- "E:/"}
+
+source(paste0(my_root,"Data/R_functions_toolbox.R"))
+
+theme_set(theme_pubr())
+
+```
+
+# DLW formatting
+
+```{r}
+dlw <- fread("data/DLW_Adelie_DDU_18_19.csv")
+dlw <- dlw[,c(1:3, 16, 31)]
+colnames(dlw) <- c("id", "bm_init", "bm_fin", "energy_exp_raw", "comment")
+
+supp_olivia <- fread("data/supp_olivia.csv")
+dlw <- left_join(dlw, supp_olivia)
+
+#Acc param to check olivia
+dlw$tot_vebda <- NA
+dlw$mean_vedba <- NA
+dlw$vedba_land <- NA
+
+#Duration from TDR
+dlw$deployment_duration_days <- NA
+dlw$sub_surface_duration_days <- NA
+dlw$dive_duration_days <- NA
+dlw$surface_duration_days <- NA
+dlw$land_duration_days <- NA
+dlw$bottom_duration_days <- NA
+dlw$ascent_duration_days <- NA
+dlw$descent_duration_days <- NA
+
+#temp for student 
+dlw$deployment_time <- ymd_hms(NA)
+dlw$recovery_time <- ymd_hms(NA)
+dlw$first_dive <- ymd_hms(NA)
+dlw$last_dive <- ymd_hms(NA)
+
+#Movement quantification
+dlw$vert_mvt_sub_surface_m <- NA
+dlw$vert_mvt_dive_m <- NA
+dlw$vert_mvt_surface_m <- NA
+dlw$vert_mvt_land_m <- NA
+
+abs_mvt <- function(x){
+  y <- abs(x - lag(x))
+}
+```
+
+# Extract depth info from tracks
+
+```{r}
+list_axy <- list.files("data/ade_trip_data")
+my_axy <- list_axy[4]
+for(my_axy in list_axy){
+  my_track <- read_rds(paste0("data/ade_trip_data/", my_axy))
+  id <- str_match(my_axy, "_\\s*(.*?)\\s*_")[,2]
+  
+  dlw$mean_vedba[which(dlw$id == id)] <- mean(my_track$VeDBA, na.rm = T)
+  dlw$tot_vebda[which(dlw$id == id)] <- sum(my_track$VeDBA, na.rm = T)
+  
+  my_tdr <- my_track[which(!is.na(my_track$pressure))]
+  my_tdr <- my_tdr %>% fill(bout_id, .direction = "updown")
+  dlw$deployment_duration_days[which(dlw$id == id)] <- difftime(my_tdr$timestamp[nrow(my_tdr)], my_tdr$timestamp[1], units = "days")
+  
+  #temp student
+  dlw$deployment_time[which(dlw$id == id)] <- my_tdr$timestamp[1]
+  dlw$recovery_time[which(dlw$id == id)] <- my_tdr$timestamp[nrow(my_tdr)]
+  
+  first_dive <- as.character(my_tdr$timestamp[min(which(my_tdr$dive == TRUE))])
+  last_dive <- as.character(my_tdr$timestamp[max(which(my_tdr$dive == TRUE))])
+  
+  dlw$first_dive[which(dlw$id == id)] <- as.character(first_dive)
+  dlw$last_dive[which(dlw$id == id)] <- as.character(last_dive)
+  #######
+
+  #Type of dive info
+  dive_label <- my_tdr %>%
+    group_by(bout_id) %>% 
+    summarise(max_depth = max(depth, na.rm = T), duration_sec = n(),
+              timestamp_max_depth = min(timestamp[which(depth == max(depth, na.rm = T))], na.rm = T))
+  
+  dive_label$type <- ifelse(dive_label$max_depth <= 1, "surface",
+                            ifelse(dive_label$max_depth > 1 & dive_label$max_depth <= 2, "sub-surface", "dive"))
+  
+  dive_label$type[1] <- "land"
+  dive_label$type[nrow(dive_label)] <- "land"
+  dive_label$type[which(dive_label$duration_sec > 21600)] <- "land" #if more than 6 hours bout, means its on land
+  #ggplot(dive_label, aes(x = timestamp_max_depth, y = max_depth, col = type, group = 1)) + geom_point()
+  my_tdr <- left_join(my_tdr, dive_label, by = "bout_id")
+  
+  # ggplot(my_tdr, aes(x = timestamp, y = depth, col = type)) + geom_point() + coord_cartesian(ylim = c(0,5))
+  classified_tdr <- my_tdr %>%
+    group_by(type) %>%
+    summarise(dur_tot_sec = n()) %>%
+    mutate(dur_tot_day = dur_tot_sec/(60*60*24))
+  
+  dlw$dive_duration_days[which(dlw$id == id)] <- classified_tdr$dur_tot_day[1]
+  dlw$land_duration_days[which(dlw$id == id)] <- classified_tdr$dur_tot_day[2]
+  dlw$sub_surface_duration_days[which(dlw$id == id)] <- classified_tdr$dur_tot_day[3]
+  dlw$surface_duration_days[which(dlw$id == id)] <- classified_tdr$dur_tot_day[4]
+  #dive phase info
+  my_tdr$dive_phase <-ifelse(my_tdr$type == "dive" & my_tdr$timestamp < my_tdr$timestamp_max_depth & my_tdr$depth < 0.8*my_tdr$max_depth, "descent", 
+                             ifelse(my_tdr$type == "dive" & my_tdr$timestamp > my_tdr$timestamp_max_depth & my_tdr$depth < 0.8*my_tdr$max_depth, "ascent",
+                                    ifelse(my_tdr$type == "dive" & my_tdr$depth >= 0.8*my_tdr$max_depth, "bottom", NA)))
+  
+  dlw$bottom_duration_days[which(dlw$id == id)] <- table(my_tdr$dive_phase)[2]/(60*60*24)
+  dlw$ascent_duration_days[which(dlw$id == id)] <- table(my_tdr$dive_phase)[1]/(60*60*24)
+  dlw$descent_duration_days[which(dlw$id == id)] <- table(my_tdr$dive_phase)[3]/(60*60*24)
+  
+  #movement_quantification
+  my_tdr$vert_mvt <- ave(my_tdr$depth, my_tdr$bout_id, FUN = abs_mvt)
+  mvmt_summary <- my_tdr %>%
+    group_by(type) %>% 
+    summarise(tot_vert_mvt = sum(vert_mvt, na.rm = T))
+  
+  dlw$vert_mvt_sub_surface_m[which(dlw$id == id)] <- mvmt_summary$tot_vert_mvt[3]
+  dlw$vert_mvt_dive_m[which(dlw$id == id)] <- mvmt_summary$tot_vert_mvt[1]
+  dlw$vert_mvt_surface_m[which(dlw$id == id)] <- mvmt_summary$tot_vert_mvt[4]
+  dlw$vert_mvt_land_m[which(dlw$id == id)] <- mvmt_summary$tot_vert_mvt[2]
+  
+  my_track <- left_join(my_track, my_tdr[,c("timestamp", "type")]) %>% fill(type, .direction = "downup")
+  vedbda <- my_track %>% group_by(type) %>% summarise(totvedba = sum(VeDBA, na.rm = T), n = n())
+  
+  dlw$vedba_land[which(dlw$id == id)] <- vedbda$totvedba[which(vedbda$type == "land")]
+  print(paste(which(list_axy == my_axy), length(list_axy),sep = "/"))
+}
+
+dlw$dee <- dlw$energy_exp_raw/dlw$mass
+dlw_filtered <- dlw %>% filter(!is.na(dee), !is.na(sex))
+
+write_rds(dlw, "data/dlw_depth_data.rds")
+
+```

@@ -1,0 +1,116 @@
+---
+title: "1 - Data Curation"
+author: "Benjamin Dupuis"
+format:
+  html: 
+    df-print: paged
+editor: visual
+theme:
+  light: flatly
+  dark: darkly
+knitr:
+  opts_knit:
+    root.dir: "/media/bdupuis/1091_PhD_BD/Research projects/tdr2nrj/"
+---
+
+```{r}
+#| label: preambule
+#| echo: false
+#| include: false
+
+rm(list=ls())
+gc()
+
+options("sp_evolution_status"=2) #for rgal retirement
+
+library(tidyverse);library(scattermore);library(viridis) 
+library(ggpubr); library(cowplot) ; library(data.table)
+library(lubridate); library(zoo); library(tools)
+
+if(Sys.info()["sysname"] == "Linux"){
+  my_root <- "/media/bdupuis/1091_PhD_BD/"
+}else{ my_root <- "D:/"}
+
+source(paste0(my_root,"Data/R_functions_toolbox.R"))
+
+theme_set(theme_pubr())
+
+```
+
+# Axy/TDR formatting
+
+```{r}
+list_axy <- list.files(paste0(my_root, "Data/Axy/CE_18-19/CR/DLW"), pattern = "*.csv")
+
+fread(paste0(my_root, "Data/Axy/CE_18-19/CR/DLW/", list_axy[1]))
+
+
+#| label: main formatting loop
+
+axy_directory <- paste0(my_root,"Data/Axy/CE_18-19/CR/DLW")
+list_axy <- list.files(axy_directory)
+my_csv <- list_axy[1]
+for(my_csv in list_axy[28:length(list_axy)]){
+  my_track  <- fread(paste(axy_directory, my_csv, sep = "/")) 
+  
+  #get sampling interval ('cause sometimes not 25 Hz)
+  sampling_int <- which(!is.na(my_track$Pressure[1:1000]))[2] - 1
+  
+  if ("Pressure" %in% colnames(my_track)) {
+    my_track$Timestamp <- dmy_hms(my_track$Timestamp)
+    
+    if(any(is.na(my_track$Pressure))){
+      my_tdr <- my_track %>% filter(!is.na(Pressure))
+    }
+    
+    my_tdr$depth <- pressure2depth(my_tdr$Pressure)
+    my_tdr$correc_depth <- clean0depth(my_tdr$depth)
+    
+    if(max(my_tdr$correc_depth, na.rm = T) > 2){
+      my_tdr <- my_tdr %>% filter(!is.na(correc_depth))
+      my_tdr$dive <- ifelse(my_tdr$correc_depth >= 1, TRUE, FALSE) # Dive is 1M
+      my_tdr$change_bout <- ifelse(my_tdr$dive != lag(my_tdr$dive), 1, 0)
+      my_tdr$change_bout[1] <- 1
+      my_tdr$bout_id <- cumsum(my_tdr$change_bout) #Here a bout is just a continuous period of dive/surface behavior
+      
+      new_depth <- my_tdr %>%
+        select(Timestamp, correc_depth, dive, change_bout, bout_id)
+      my_global_trip <- left_join(my_track, new_depth)
+      colnames(my_global_trip) <- c("tag_id", "timestamp", "X", "Y", "Z",
+                                    "activity", "pressure", "temp",
+                                    "ori_lat", "ori_lon", "height_above_msl",
+                                    "ground_speed", "satellite_count",
+                                    "hdop","max_signal_strength", "battery_v",
+                                    "metadata", "depth", "dive",
+                                    "change_bout", "bout_id")
+      
+      #calculate acceleration derived parameters
+      my_global_trip$X_rollmean <- rollmean(my_global_trip$X, sampling_int, align="center", na.pad=TRUE)
+      my_global_trip$Y_rollmean <- rollmean(my_global_trip$Y, sampling_int, align="center", na.pad=TRUE)
+      my_global_trip$Z_rollmean <- rollmean(my_global_trip$Z, sampling_int, align="center", na.pad=TRUE)
+      my_global_trip$pitch <- atan2(my_global_trip$X_rollmean,(sqrt(my_global_trip$Y_rollmean^2+my_global_trip$Z_rollmean^2)))*180/pi
+      my_global_trip$roll <- atan2(my_global_trip$Y_rollmean,(sqrt(my_global_trip$X_rollmean^2+my_global_trip$Z_rollmean^2)))*180/pi
+      my_global_trip$D_X <- my_global_trip$X - my_global_trip$X_rollmean
+      my_global_trip$D_Y <- my_global_trip$Y - my_global_trip$Y_rollmean
+      my_global_trip$D_Z <- my_global_trip$Z - my_global_trip$Z_rollmean
+      my_global_trip$VeDBA <- sqrt(my_global_trip$D_X^2 + my_global_trip$D_Y^2 + my_global_trip$D_Z^2)
+      
+      #correct pitch
+      filtered_track <- my_global_trip %>% #get surface when penguin is not moving
+        filter(bout_id > 1, bout_id < max(bout_id), depth == 0,
+               VeDBA < 0.25)
+      my_quantile <- quantile(filtered_track$pitch, probs = c(0.25, 0.75))
+      filtered_track <- my_global_trip %>% #focus on the resting at sea, remove standing up
+        filter(bout_id > 1, bout_id < max(bout_id), depth == 0,
+               VeDBA < 0.25, pitch > my_quantile[1], pitch < my_quantile[2])
+      new_pitch <- mean(filtered_track$pitch)
+      my_global_trip$corr_pitch <- my_global_trip$pitch - new_pitch
+      
+      saveRDS(my_global_trip,
+              paste0("data/ade_trip_data/", file_path_sans_ext(my_csv),".rds"))
+      print(paste(which(my_csv == list_axy), length(list_axy), sep = "/"))
+    }
+  }
+}
+
+```

@@ -1,0 +1,201 @@
+---
+title: "Energy Balance"
+author: "Benjamin Dupuis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r preambule}
+rm(list=ls())
+library(tidyverse);library(cowplot)
+library(ggpubr); library(viridis)
+library(tidymodels);library(ggeffects)
+theme_set(theme_pubr())
+```
+
+First lets get time spent hunting per deployment
+```{r pred hunt}
+#Unknown data 
+rf_raw <- read_rds("data/Adélie_data_18-19_EM/unknown_unbalanced_for_prediction.rds")
+rf_raw_2 <- read_rds("data/Adélie_data_18-19_EM/rf_unbalanced_for_train.rds")
+rf_raw <- rbind(rf_raw_2, rf_raw)
+
+#Load best rf model
+best_model <- read_rds("data/Adélie_data_18-19_EM/rf_best_model.rds")
+
+#Label original data
+to_label_pengu <- rf_raw
+my_pred <- predict(best_model, to_label_pengu)
+to_label_pengu$predicted_state <- my_pred$.pred_class
+to_label_pengu <- to_label_pengu %>% mutate( groupid = data.table::rleid(predicted_state) )
+to_label_pengu <- to_label_pengu %>% mutate( groupid_ref = data.table::rleid(state) )
+
+grp_hunt_pred <- to_label_pengu %>%
+  group_by(trip_id, tag_id, id, predicted_state) %>% 
+  summarise(t_hunt_s = n()) %>%
+  filter(predicted_state == "Hunting") %>%
+  select(-predicted_state) %>% 
+  mutate(t_hunt_hrs = t_hunt_s/(60*60))
+```
+
+Then get mass specific daily energy expenditure
+```{r DEE}
+dlw <- read_rds("data/dlw_depth_data.rds")
+dlw$dee_init <- dlw$energy_exp_raw/(dlw$bm_init)
+dlw_filtered <- dlw %>% filter(!is.na(dee), !is.na(sex), mean_vedba < 1000000)
+
+#hrs instead of days for lisibility
+dlw_filtered <- dlw_filtered %>% mutate(dive_duration_hrs = dive_duration_days*24,
+                        sub_surface_duration_hrs = sub_surface_duration_days*24,
+                        deployment_duration_hrs = deployment_duration_days*24,
+                        surface_duration_hrs = surface_duration_days*24,
+                        land_duration_hrs = land_duration_days*24,
+                        bottom_duration_hrs = bottom_duration_days*24,
+                        ascent_duration_hrs = ascent_duration_days*24,
+                        descent_duration_hrs = descent_duration_days*24)
+
+#daily_lvl
+dlw_filtered <- dlw_filtered %>% mutate(daily_dive_duration_hrs = dive_duration_hrs/deployment_duration_days,
+                        daily_sub_surface_duration_hrs = sub_surface_duration_hrs/deployment_duration_days,
+                        daily_surface_duration_hrs = surface_duration_hrs/deployment_duration_days,
+                        daily_land_duration_hrs = land_duration_hrs/deployment_duration_days,
+                        daily_bottom_duration_hrs = bottom_duration_hrs/deployment_duration_days,
+                        daily_ascent_duration_hrs = ascent_duration_hrs/deployment_duration_days,
+                        daily_descent_duration_hrs = descent_duration_hrs/deployment_duration_days,
+                        daily_vert_mvt_surface_m = vert_mvt_surface_m/deployment_duration_days,
+                        daily_vert_mvt_sub_surface_m = vert_mvt_sub_surface_m/deployment_duration_days,
+                        daily_vert_mvt_dive_m = vert_mvt_dive_m/deployment_duration_days,
+                        at_sea_duration_hrs = deployment_duration_hrs - land_duration_hrs)
+
+dee_model <- readRDS("data/best_exp_model.rds")
+dlw_filtered$pred_dee_mass <- predict(dee_model, dlw_filtered)
+```
+
+check relationship
+```{r balance}
+global_balance_df <- left_join(dlw_filtered, grp_hunt_pred) %>%
+  select(id, trip_id, tag_id, bm_init, dee_init, sex, pred_dee_mass, t_hunt_hrs, deployment_duration_days, at_sea_duration_hrs, dive_h) %>% 
+  mutate(pred_total_ee = pred_dee_mass * bm_init * deployment_duration_days,
+         daily_foraging_hrs = t_hunt_hrs/deployment_duration_days)
+
+
+#Are penguins foraging more during longer trip ? NO
+hunt_model <- lm(t_hunt_hrs ~ at_sea_duration_hrs + sex,
+                 data = global_balance_df,
+                 na.action = "na.fail")
+
+flextable::save_as_docx(nice_table(dredge(hunt_model)), path = "figure/balance/mod_select_foraging_vs_at_sea.docx")
+
+my_palette <- c("#D81B60", "#1E88E5")
+
+p1 <- ggplot(global_balance_df, aes(x = at_sea_duration_hrs, y = t_hunt_hrs, col = sex, shape = sex)) +
+  geom_point(size = 3) + 
+  labs_pubr() +
+  scale_color_manual(values = my_palette) +
+  labs(x = "Time spent at-sea (hours)", y = "Time spent foraging (hours)", col = "Sex", shape = "Sex")
+
+svg(filename = "figure/balance/foraging_vs_deployement.svg", width = 7, height = 5)
+p1
+dev.off()
+
+#Are penguins expending more energy when foraging more ? 
+balance_model <- lm(pred_dee_mass ~ daily_foraging_hrs + sex,
+                 data = global_balance_df,
+                 na.action = "na.fail")
+
+flextable::save_as_docx(nice_table(dredge(balance_model)), path = "figure/balance/mod_select_foraging_vs_dee.docx")
+summary(balance_model)
+
+balance_plot <- plot(ggpredict(balance_model, terms = c("daily_foraging_hrs [sample=30]","sex")), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  scale_color_manual(values = my_palette) +
+  labs(x = "Time spent foraging (hours.d<sup>-1</sup>))", y = "TDR-estimated mass specific DEE (kJ.g<sup>-1</sup>.d<sup>-1</sup>)", col = "Sex", title = "") +
+  theme(axis.title = element_markdown(),
+        legend.position = "none")
+
+tweak_balance_plot <- ggplot_build(balance_plot)
+tweak_balance_plot$data[[1]]$shape <- ifelse(tweak_balance_plot$data[[1]]$group == 1, 16, 17)
+balance_plot <- ggplotify::as.ggplot(ggplot_gtable(tweak_balance_plot))
+
+dummy_legend <- ggplot(data = global_balance_df, aes(x = daily_foraging_hrs, y = pred_dee_mass, col = sex, shape = sex)) +
+  geom_point(size = 3) +
+  geom_line() +
+  labs(col = "Sex", shape = "Sex") + 
+  theme_pubr() + 
+  labs_pubr() +
+  scale_color_manual(values = my_palette) +
+  theme(legend.position = "right",
+        axis.title = element_markdown())
+legend <- cowplot::get_legend(dummy_legend)
+
+svg(filename = "figure/balance/dee_vs_foraging.svg", width = 8, height = 5)
+cowplot::plot_grid(balance_plot, legend, rel_widths = c(1,0.1))
+dev.off()
+
+```
+
+inspect individual with not much foraging
+```{r}
+plotly::ggplotly(ggplot(global_balance_df, aes(x = at_sea_duration_hrs, y = t_hunt_hrs, col = id, shape = sex)) +
+           geom_point(size = 3) + 
+           labs_pubr() +
+           labs(x = "Time spent at-sea (hours)", y = "Time spent foraging (hours)", col = "Sex", shape = "Sex")
+)
+
+plotly::ggplotly(ggplot(global_balance_df, aes(x = dive_h, y = t_hunt_hrs, col = id, shape = sex)) +
+           geom_point(size = 3) + 
+           labs_pubr() +
+           labs(x = "Time spent diving", y = "Time spent foraging (hours)", col = "Sex", shape = "Sex")
+)
+
+plotly::ggplotly(ggplot(global_balance_df, aes(x = dive_h, y = at_sea_duration_hrs, col = id, shape = sex)) +
+           geom_point(size = 3) + 
+           labs_pubr() +
+           labs(x = "Time spent diving", y = "at sea", col = "Sex", shape = "Sex")
+)
+
+plotly::ggplotly(ggplot(global_balance_df, aes(x = daily_foraging_hrs, y = pred_dee_mass, col = id, shape = sex)) +
+           geom_point(size = 3) + 
+           labs_pubr()
+)
+```
+ weird indiv are F8, F25, 31 and 34 lets look at them
+ 
+```{r}
+ggplot() +
+  geom_line(data = to_label_pengu %>% filter(id == "F8"), aes(x = timestamp, y = -depth)) +
+  geom_point(data = to_label_pengu %>% filter(id == "F8", predicted_state == "Hunting"), aes(x = timestamp, y = -depth), col = "#5f4bb8") +
+  labs(title = "F8")
+
+ggplot() +
+  geom_line(data = to_label_pengu %>% filter(id == "F25"), aes(x = timestamp, y = -depth)) +
+  geom_point(data = to_label_pengu %>% filter(id == "F25", predicted_state == "Hunting"), aes(x = timestamp, y = -depth), col = "#5f4bb8") +
+  labs(title = "F25")
+
+ggplot() +
+  geom_line(data = to_label_pengu %>% filter(id == "F31"), aes(x = timestamp, y = -depth)) +
+  geom_point(data = to_label_pengu %>% filter(id == "F31", predicted_state == "Hunting"), aes(x = timestamp, y = -depth), col = "#5f4bb8") +
+  labs(title = "F31")
+
+plotly::ggplotly(ggplot() +
+  geom_line(data = to_label_pengu %>% filter(id == "F34"), aes(x = timestamp, y = -depth)) +
+  geom_point(data = to_label_pengu %>% filter(id == "F34", predicted_state == "Hunting"), aes(x = timestamp, y = -depth), col = "#5f4bb8") +
+  labs(title = "F34"))
+
+#Average/random individual 
+ggplot() +
+  geom_line(data = to_label_pengu %>% filter(id == "F13"), aes(x = timestamp, y = -depth)) +
+  geom_point(data = to_label_pengu %>% filter(id == "F13", predicted_state == "Hunting"), aes(x = timestamp, y = -depth), col = "#5f4bb8") +
+  labs(title = "F13")
+
+plotly::ggplotly(ggplot() +
+  geom_line(data = to_label_pengu %>% filter(id == "F27"), aes(x = timestamp, y = -depth)) +
+  geom_point(data = to_label_pengu %>% filter(id == "F27", predicted_state == "Hunting"), aes(x = timestamp, y = -depth), col = "#5f4bb8") +
+  labs(title = "F27"))
+```
+ 
