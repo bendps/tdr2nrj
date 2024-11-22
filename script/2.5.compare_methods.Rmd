@@ -1,0 +1,388 @@
+---
+title: "Compare methods"
+author: "Benjamin Dupuis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r preambule}
+rm(list=ls())
+library(tidyverse)
+library(vip); library(cowplot)
+library(tidymodels);library(themis)
+library(doParallel);library(parallel)
+library(ggpubr); library(viridis)
+library(ggeffects) ; library(rcompanion)
+library(rempsyc);library(MuMIn) ; library(sjPlot)
+library(gtsummary) ; library(ggtext)
+theme_set(theme_pubr())
+```
+
+
+```{r load}
+#Unknown data 
+rf_raw <- read_rds("data/Adélie_data_18-19_EM/unknown_unbalanced_for_prediction.rds")
+# rf_raw2 <- read_rds("data/Adélie_data_18-19_EM/rf_unbalanced_for_train.rds")
+# rf_raw <- rbind(rf_raw, rf_raw2)
+```
+# RF 
+```{r rf}
+#Load best rf model
+best_model <- read_rds("data/Adélie_data_18-19_EM/rf_best_model.rds")
+#Label original data
+to_label_pengu <- rf_raw
+my_pred <- predict(best_model, to_label_pengu)
+to_label_pengu$predicted_state <- my_pred$.pred_class
+to_label_pengu <- to_label_pengu %>% mutate( groupid = data.table::rleid(predicted_state) )
+to_label_pengu <- to_label_pengu %>% mutate( groupid_ref = data.table::rleid(state) )
+
+#Examine a bit deeper where the classification is good or not
+to_label_pengu$rf_success <- ifelse(to_label_pengu$state == to_label_pengu$predicted_state, "OK", "No")
+
+to_label_pengu$state <- ifelse(to_label_pengu$state == "Other", 0, 1)
+to_label_pengu$predicted_state <- ifelse(to_label_pengu$predicted_state == "Other", 0, 1)
+
+#Get the number of PCE per dive and per trip
+#Also get time hunting per dive and per trip
+#And compare to bottom duration
+to_label_pengu$bottom <- ifelse(to_label_pengu$phase == "Bottom", 1, 0)
+
+hunt_time <- to_label_pengu %>%
+  group_by(trip_id, dive_id, dive_duration) %>%
+  summarise(time_hunt_s = sum(state),
+            bottom_duration = sum(bottom),
+            time_start = min(timestamp),
+            time_end = max(timestamp))
+
+pred_hunt_time <- to_label_pengu %>%
+  group_by(trip_id, dive_id, dive_duration) %>%
+  summarise(pred_time_hunt_s = sum(predicted_state))
+
+hunt_time <- left_join(hunt_time, pred_hunt_time)
+hunt_time_dive <- hunt_time %>% mutate(prop_hunt = time_hunt_s/dive_duration,
+                                       prop_pred_hunt = pred_time_hunt_s/dive_duration,
+                                       prop_bottom = bottom_duration/dive_duration,
+                                       )
+
+hunt <- to_label_pengu %>%
+  group_by(trip_id, dive_id, groupid_ref, state) %>%
+  summarise() %>% 
+  group_by(trip_id, dive_id) %>% 
+  summarise(pce = sum(state))
+
+pred_pce <- to_label_pengu %>%
+  group_by(trip_id, dive_id, groupid, predicted_state) %>%
+  summarise() %>% 
+  group_by(trip_id, dive_id) %>% 
+  summarise(pred_pce = sum(predicted_state))
+
+pce_dive <- left_join(pred_pce, hunt)
+dive_lvl <- left_join(pce_dive, hunt_time_dive)
+```
+
+```{r dive plot}
+
+predict_plot <- ggplot(to_label_pengu[11415:11930,], aes(x = timestamp, y = -depth, group = dive_id)) +
+  geom_line() +
+  geom_point(data = to_label_pengu[11415:11930,] %>% filter(predicted_state == 1), color = "#5c48b7") +
+  labs_pubr() +
+  labs(y = "prediction") +
+  theme(axis.title.x = element_blank())
+
+ref_plot <- ggplot(to_label_pengu[11415:11930,], aes(x = timestamp, y = -depth, group = dive_id)) +
+  geom_path() +
+  geom_point(data = to_label_pengu[11415:11930,] %>% filter(state == 1), color = "#5c48b7") + 
+  labs_pubr() +
+  labs(y = "ref") +
+  theme(axis.title.x = element_blank())
+
+svg("figure/hunt_rf/dive_visual_prediction.svg", height = 5, width = 10)
+cowplot::plot_grid(predict_plot, ref_plot, ncol = 1)
+dev.off()
+```
+
+# Manual calculation of Wiggles/Bottom
+based on https://doi.org/10.1038/s41598-021-02451-4 and/or https://doi.org/10.1007/s00227-020-03711-z
+
+```{r wiggle}
+manual_raw <- rf_raw 
+
+manual_raw %>% filter(dive_id == 1652) %>% ggplot(aes(x = timestamp, y = vert_speed)) + geom_path()
+manual_raw %>% filter(dive_id == 1652) %>% ggplot(aes(x = timestamp, y = vert_accel)) + geom_path()
+manual_raw %>% filter(dive_id == 1652) %>% ggplot(aes(x = timestamp, y = -depth, col = as.factor(phase))) + geom_path()
+
+
+manual_raw$wiggle <- ifelse(ifelse(rf_raw$vert_speed < 0, -1, 1) + lag(ifelse(rf_raw$vert_speed < 0, -1, 1)) == 0 , 1, 0)
+manual_raw$large_wiggle <- ifelse(manual_raw$wiggle == 1 & abs(manual_raw$vert_accel) >= 1, 1, 0)
+
+#Remove wrong wiggle at dive start
+dive_id <- manual_raw %>%
+  mutate(index = 1:nrow(manual_raw)) %>%
+  group_by(dive_id) %>% 
+  summarise(start_dive = min(index),
+            end_dive = max(index),
+            n_wiggle = sum(large_wiggle, na.rm = T))
+manual_raw$wiggle[dive_id$start_dive] <- 0
+
+manual_raw$state <- ifelse(manual_raw$state == "Other", 0, 1)
+manual_raw$phase <- ifelse(manual_raw$phase == "Bottom", 1, 0)
+manual_dive <- manual_raw %>%
+  group_by(dive_id) %>%
+  summarise(n_wiggle = sum(wiggle, na.rm = T),
+            prop_hunt_25hz = mean(hunt_proportion),
+            prop_hunt_1hz = sum(state)/n(),
+            n_hunt = sum(state),
+            bottom_duration = sum(phase),
+            n_wiggle_large = sum(large_wiggle, na.rm = T)) 
+
+
+
+#NEW PHASES ANNOTATION, from 1st large wiggle to the last#
+bottom_phase_id <- manual_raw %>%
+  mutate(index = 1:nrow(manual_raw)) %>% 
+  filter(large_wiggle != 0) %>% 
+  group_by(dive_id) %>% 
+  summarise(start_bottom = min(index),
+            end_bottom = max(index))
+
+manual_raw$new_label_phase <- NA
+
+for (my_bottom in unique(bottom_phase_id$dive_id)) {
+  manual_raw$new_label_phase[dive_id$start_dive[which(dive_id$dive_id == my_bottom)]:bottom_phase_id$start_bottom[which(bottom_phase_id$dive_id == my_bottom)]] <- "Descent"
+  manual_raw$new_label_phase[bottom_phase_id$end_bottom[which(bottom_phase_id$dive_id == my_bottom)]:dive_id$end_dive[which(dive_id$dive_id == my_bottom)]] <- "Ascent"
+    manual_raw$new_label_phase[bottom_phase_id$start_bottom[which(bottom_phase_id$dive_id == my_bottom)]:bottom_phase_id$end_bottom[which(bottom_phase_id$dive_id == my_bottom)]] <- "Bottom"
+}
+manual_raw$new_label_phase[which(is.na(manual_raw$new_label_phase))] <- "Shallow"
+manual_raw$new_label_phase <- ifelse(manual_raw$new_label_phase == "Bottom", 1, 0)
+manual_dive <- manual_raw %>%
+  group_by(dive_id) %>%
+  summarise(n_wiggle = sum(wiggle, na.rm = T),
+            prop_hunt_25hz = mean(hunt_proportion),
+            prop_hunt_1hz = sum(state)/n(),
+            n_hunt = sum(state),
+            bottom_duration = sum(phase),
+            bottom_duration_wiggle = sum(new_label_phase),
+            n_wiggle_large = sum(large_wiggle, na.rm = T)) 
+
+dive_lvl <- left_join(dive_lvl,manual_dive[,c(1,2,7,8)])
+
+#Now look at the trip level
+trip_lvl <- dive_lvl %>%
+  group_by(trip_id) %>%
+  summarise(tot_pce = sum(pce),
+            tot_pred_pce = sum(pred_pce),
+            tot_hunt_hrs = sum(time_hunt_s)/60/60,
+            tot_pred_hunt_hrs = sum(pred_time_hunt_s)/60/60,
+            tot_dive_duration_hrs = sum(dive_duration)/60/60,
+            tot_bottom_duration_hrs = sum(bottom_duration)/60/60,
+            tot_wiggle = sum(n_wiggle),
+            n_dive = n())
+
+trip_duration <- to_label_pengu %>% group_by(trip_id) %>% 
+  summarise(trip_beg = min(timestamp),
+            trip_end = max(timestamp)) %>% 
+  mutate(trip_duration_hrs = as.numeric(trip_end - trip_beg))
+
+trip_lvl <- left_join(trip_lvl, trip_duration) %>%
+  mutate(prop_hunt = tot_hunt_hrs/trip_duration_hrs,
+         pred_prop_hunt = tot_pred_hunt_hrs/trip_duration_hrs,
+         prop_bottom = tot_bottom_duration_hrs/trip_duration_hrs)
+```
+
+Get daily proportion
+```{r daily prop}
+trip_lvl <- trip_lvl %>% mutate(ref_daily_pce = tot_pce/(trip_duration_hrs/24),
+                    ref_daily_hunt_hrs = tot_hunt_hrs/(trip_duration_hrs/24),
+                    daily_bottom_duration_hrs = tot_bottom_duration_hrs/(trip_duration_hrs/24),
+                    daily_wiggle = tot_wiggle/(trip_duration_hrs/24),
+                    daily_n_dive = n_dive/(trip_duration_hrs/24),
+                    pred_daily_pce = tot_pred_pce/(trip_duration_hrs/24),
+                    pred_daily_hunt_hrs = tot_pred_hunt_hrs/(trip_duration_hrs/24),
+                    )
+```
+
+
+# Compare rf and historical measures
+```{r comparison}
+#Trip level
+#PCE
+pce_full_model <- lm(ref_daily_pce ~ pred_daily_hunt_hrs + pred_daily_pce + daily_bottom_duration_hrs + daily_wiggle + daily_n_dive,
+                      na.action = "na.fail",
+                      data = trip_lvl)
+nice_table(dredge(pce_full_model))
+
+pce_best_model_1 <- lm(ref_daily_pce ~ pred_daily_pce,
+   data = trip_lvl)
+pce_best_model_2 <- lm(ref_daily_pce ~ pred_daily_pce + daily_wiggle,
+   data = trip_lvl)
+pce_best_model_3 <- lm(ref_daily_pce ~ pred_daily_pce + daily_n_dive,
+   data = trip_lvl)
+pce_best_null_1 <- lm(ref_daily_pce ~ daily_bottom_duration_hrs,
+   data = trip_lvl)
+pce_best_null_2 <- lm(ref_daily_pce ~ daily_wiggle,
+   data = trip_lvl)
+pce_best_null_3 <- lm(ref_daily_pce ~ trip_duration_hrs,
+   data = trip_lvl)
+
+summary(pce_best_model_1)
+plot_model(pce_best_model_1, type = "diag")
+summary(pce_best_model_2)
+plot_model(pce_best_model_2, type = "diag")
+summary(pce_best_model_3)
+plot_model(pce_best_model_3, type = "diag")
+
+summary(pce_best_null_1)
+plot_model(pce_best_null_1, type = "diag")
+summary(pce_best_null_2)
+plot_model(pce_best_null_2, type = "diag")
+summary(pce_best_null_3)
+plot_model(pce_best_null_3, type = "diag")
+
+mod_select <- compareLM(pce_best_model_1, pce_best_model_2, pce_best_model_3, pce_best_null_1, pce_best_null_2, pce_best_null_3)
+mod_select <- cbind(mod_select$Models, mod_select$Fit.criteria[,c(1,3:5)])
+delta_aic <- qpcR::akaike.weights(mod_select$AICc)
+adj.r.sqrd <- round(c(summary(pce_best_model_1)$adj.r.squared,
+                summary(pce_best_model_2)$adj.r.squared,
+                summary(pce_best_model_3)$adj.r.squared,
+                summary(pce_best_null_1)$adj.r.squared,
+                summary(pce_best_null_2)$adj.r.squared,
+                summary(pce_best_null_3)$adj.r.squared),2)
+mod_select$delta_aicc <- delta_aic$deltaAIC
+mod_select$weight <- round(delta_aic$weights, 2)
+mod_select$adj.r.sqrd <- adj.r.sqrd
+mod_select_print <- nice_table(mod_select)
+mod_select_print
+flextable::save_as_docx(mod_select_print, path = "figure/method_compare/mod_select_PCE.docx")
+
+#best model output
+mod_summary <- tbl_regression(pce_best_model_1,
+               label = list(pred_daily_pce ~ "N(PCE) per day"),
+               intercept = T,
+               estimate_fun = function(x) mapply(round, x, digits = 2)
+               ) %>% 
+ # add_vif() %>% 
+  italicize_labels() %>% 
+  as_flex_table()
+mod_summary
+flextable::save_as_docx(mod_summary, path = "figure/method_compare/summary_best_pce.docx")
+
+pce_model <- plot(ggpredict(pce_best_model_1, terms = "pred_daily_pce [sample=20]"), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  coord_equal() +
+  labs(x = "Predicted number of PCE per day", y = "Reference number of PCE per day", title = "")
+
+
+svg("figure/method_compare/best_model_pce.svg", height = 5, width = 5)
+pce_model
+dev.off()
+
+#Time hunting
+hunt_full_model <- lm(ref_daily_hunt_hrs ~ pred_daily_hunt_hrs + pred_daily_pce + daily_bottom_duration_hrs + daily_wiggle + daily_n_dive,
+                      na.action = "na.fail",
+                      data = trip_lvl)
+nice_table(dredge(hunt_full_model))
+
+hunt_best_model_1 <- lm(ref_daily_hunt_hrs ~ pred_daily_hunt_hrs,
+   data = trip_lvl,
+   family = gaussian)
+hunt_best_model_2 <- lm(ref_daily_hunt_hrs ~ pred_daily_hunt_hrs + daily_bottom_duration_hrs,
+   data = trip_lvl)
+hunt_best_model_3 <- lm(ref_daily_hunt_hrs ~ pred_daily_hunt_hrs + daily_n_dive,
+   data = trip_lvl)
+hunt_best_null_1 <- lm(ref_daily_hunt_hrs ~ daily_bottom_duration_hrs,
+   data = trip_lvl)
+hunt_best_null_2 <- lm(ref_daily_hunt_hrs ~ daily_wiggle,
+   data = trip_lvl)
+hunt_best_null_3 <- lm(ref_daily_hunt_hrs ~ trip_duration_hrs,
+   data = trip_lvl)
+
+
+summary(hunt_best_model_1)
+plot_model(hunt_best_model_1, type = "diag")
+summary(hunt_best_model_2)
+plot_model(hunt_best_model_2, type = "diag")
+summary(hunt_best_model_3)
+plot_model(hunt_best_model_3, type = "diag")
+summary(hunt_best_null_1)
+plot_model(hunt_best_null_1, type = "diag")
+summary(hunt_best_null_2)
+plot_model(hunt_best_null_2, type = "diag")
+summary(hunt_best_null_3)
+plot_model(hunt_best_null_3, type = "diag")
+
+mod_select <- compareLM(hunt_best_model_1, hunt_best_model_2, hunt_best_model_2, hunt_best_null_1, hunt_best_null_2, hunt_best_null_3)
+mod_select <- cbind(mod_select$Models, mod_select$Fit.criteria[,c(1,3:5)])
+delta_aic <- qpcR::akaike.weights(mod_select$AICc)
+adj.r.sqrd <- round(c(summary(hunt_best_model_1)$adj.r.squared,
+                      summary(hunt_best_model_2)$adj.r.squared,
+                      summary(hunt_best_model_3)$adj.r.squared,
+                      summary(hunt_best_null_1)$adj.r.squared,
+                      summary(hunt_best_null_2)$adj.r.squared,
+                      summary(hunt_best_null_3)$adj.r.squared),2)
+mod_select$delta_aicc <- delta_aic$deltaAIC
+mod_select$weight <- round(delta_aic$weights, 2)
+mod_select$adj.r.sqrd <- adj.r.sqrd
+mod_select_print <- nice_table(mod_select)
+mod_select_print
+flextable::save_as_docx(mod_select_print, path = "figure/method_compare/mod_select_hunt.docx")
+
+#best model output
+mod_summary <- tbl_regression(hunt_best_model_1,
+               label = list(pred_daily_hunt_hrs ~ "Time(TDR-estimated hunting)"),
+               intercept = T,
+               estimate_fun = function(x) mapply(format, x, scientific = abs(x) < 0.01, digits = 2)
+               ) %>% 
+  # add_vif() %>% 
+  italicize_labels() %>% 
+  as_flex_table()
+mod_summary
+flextable::save_as_docx(mod_summary, path = "figure/method_compare/summary_best_hunt.docx")
+
+hunt_model_hunt <- plot(ggpredict(hunt_best_model_1, terms = "pred_daily_hunt_hrs [sample=20]"), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  coord_equal() +
+  labs(x = "TDR-estimated time spent feeding (hours.day<sup>-1</sup>)", y = "Reference time spent feeding (hours.day<sup>-1</sup>)", title = "") +
+  theme(axis.title = element_markdown()) +
+  coord_flip() 
+
+svg("figure/method_compare/best_model_hunt.svg", height = 5, width = 5)
+hunt_model_hunt
+dev.off()
+
+```
+
+```{r quick plot}
+hunt_model_hunt <- plot(ggpredict(hunt_best_model_1, terms = "pred_daily_hunt_hrs [sample=20]"), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  coord_equal() +
+  labs(x = "pred hunt", y = "ref hunt", title = "") +
+  theme(axis.title = element_markdown())
+
+hunt_model_bottom <- plot(ggpredict(hunt_best_null_1, terms = "daily_bottom_duration_hrs [sample=20]"), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  labs(x = "bottom dur", y = "ref hunt", title = "") +
+  theme(axis.title = element_markdown())
+
+hunt_model_wiggle <- plot(ggpredict(hunt_best_null_2, terms = "daily_wiggle [sample=20]"), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  labs(x = "wiggle)", y = "ref hunt", title = "") +
+  theme(axis.title = element_markdown())
+
+
+grid <- cowplot::plot_grid(hunt_model_bottom, hunt_model_wiggle, ncol = 1)
+svg("figure/method_compare/compare_proxi.svg", height = 5, width = 9)
+cowplot::plot_grid(hunt_model_hunt, grid , ncol = 2)
+dev.off()
+
+
+```
+

@@ -1,0 +1,288 @@
+---
+title: "ML_classification_setup"
+author: "Benjamin Dupuis"
+date: "19/04/2022"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading, message=FALSE, warning=FALSE}
+rm(list=ls())
+library(tidyverse);library(vip)
+library(tidymodels);library(themis)
+library(doParallel);library(parallel)
+library(Boruta);library(scattermore)
+library(lubridate);library(see)
+library(viridis);library(knitr)
+library(kableExtra);library(cowplot)
+library(foreach); library(corrplot)
+library(ggpubr)
+theme_set(theme_pubr())
+```
+
+We use 2018-19 season to train and test the RF because we have both
+accelerometers and TDR data for this season. The accelerometers
+classification was previously done by Mariana.
+
+# Variable selection
+
+To start we need to select the variables we'll use in the RF. First we
+get rid of the ones that are irrelevant like IDs or timestamp.
+
+For the ones left, we first calculate their respective importance for
+predicting hunting using the Boruta package and then we look at
+variables correlation.
+
+```{r variable selection, message=FALSE, warning=FALSE}
+pengu_tdr <- read_rds("data/Adélie_data_18-19_EM/rf_unbalanced_for_train.rds")
+
+#Variable selection using boruta and cor()
+var_tdr <- pengu_tdr[sample(1:nrow(pengu_tdr), 10000),] %>%
+  select(max_dive_depth, dive_duration, depth,
+         vert_speed, roll_mean_vert_speed, roll_sd_vert_speed,
+         vert_accel, roll_mean_vert_accel, roll_sd_vert_accel,
+         sex, state) %>% 
+  na.omit()
+
+var_imp <- Boruta(as.factor(var_tdr$state) ~ ., data = var_tdr %>% select(-state), doTrace = 2, maxRuns = 1000)
+var_cor <- cor(var_tdr %>% select(-c(state, sex)))
+
+par(mfrow = c(1,2))
+plot(var_imp, las = 2, cex.axis = 0.7)
+corrplot(var_cor, type = "lower", diag = FALSE) 
+dev.off()
+```
+
+Based on that we can do apply a variable selection. When 2 variables are
+highly correlated (>0.8), we only keep the one with the highest
+importance score. In this case:
+
+-   We remove roll_sd_vert_speed and keep roll_sd_vert_accel
+
+-   We remove vert_speed and keep roll_mean_vert_speed
+
+-   We remove max_dive_depth and keep dive_duration
+
+-   Remove Sex
+
+```{r remove variables, message=FALSE, warning=FALSE}
+var_tdr_filtered <- var_tdr %>%
+  select(-c(roll_sd_vert_speed, vert_speed, max_dive_depth, sex))
+
+var_tdr_filtered$state <- as.factor(var_tdr_filtered$state)
+
+#Re-check importance and correlation after filter
+var_imp_filtered <- Boruta(as.factor(var_tdr_filtered$state) ~ ., data = var_tdr_filtered %>% select(-state), doTrace = 2, maxRuns = 1000)
+var_cor_filtered <- cor(var_tdr_filtered %>% select(-c(state)))
+
+par(mfrow = c(1,2))
+plot(var_imp_filtered, las = 2, cex.axis = 0.5)
+corrplot(var_cor_filtered, type = "lower", diag = FALSE) 
+dev.off()
+```
+
+We now have 6 remaining tdr derived variables (listed in order of
+importance for the classification according to Boruta):
+
+-   roll_sd_vert_accel, a measure of the sinuosity
+
+-   roll_mean_vert_speed, a measure of vertical speed at coarse scale
+
+-   roll_mean_vert_accel, a measure of vertical acceleration at coarse
+    scale
+
+-   vert_accel, a measure of local/instantaneous vertical acceleration
+
+-   dive_duration, to account for long vs. short/shallow dives
+
+-   depth
+
+And categorical variables like and sex
+
+# Random forest
+
+Because overall hunting events are rare, we need to add an upsampling
+step in the recipe.
+
+```{r base model}
+trip_tdr <- pengu_tdr[sample(1:nrow(pengu_tdr), 100000),] %>% select(colnames(var_tdr_filtered))
+trip_tdr$state <- as.factor(trip_tdr$state)
+trip_tdr_split <- initial_split(trip_tdr, strata = state) #split and keep the same proportion of hunting
+trip_tdr_train <- training(trip_tdr_split)
+trip_tdr_test <- testing(trip_tdr_split)
+
+ranger_spec <-
+  rand_forest(trees = 500, mtry = 2) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", num.threads = detectCores(logical = F) - 1)
+
+ranger_recipe_sample <-
+  recipe(formula = state ~ ., data = trip_tdr_train) %>%
+  themis::step_upsample(state)
+
+ranger_workflow_sample <-
+  workflow() %>%
+  add_recipe(ranger_recipe_sample) %>%
+  add_model(ranger_spec)
+
+model_rf <- ranger_workflow_sample %>% 
+  fit(data = trip_tdr_train)
+```
+
+```{r evalution first model}
+model_rf %>% extract_fit_parsnip()
+
+caret::confusionMatrix(as.factor(trip_tdr_test$state), predict(model_rf, new_data = trip_tdr_test)$.pred_class)
+```
+
+First model is quite good, with OOB = 0.06, accuracy = 0.85, hunting
+pred value = 0.70, and other pred value = 0.91. We then try to tune the
+hyperparameters (mtry and trees) to see if we can enhance it. Same with/without sex so we remove it 
+
+```{r hyperparameters tuning}
+trip_tdr_folds <- vfold_cv(trip_tdr_train, strata = state)
+
+model_tune <-
+  rand_forest(mtry = tune(), trees = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", num.threads = detectCores(logical = F) - 1)
+
+grid <- grid_regular(mtry(range = c(1,6)), trees(range = c(100,1000)), levels = 7)
+grid <- tibble(mtry = rep(c(1:6),4) ,trees = rep(c(50,100,500,1000), each = 6)) #manual grid version
+
+train2 <- prep(ranger_recipe_sample) %>%
+  juice()
+test2 <- prep(ranger_recipe_sample) %>%
+  bake(trip_tdr_test)
+
+fold <- vfold_cv(train2, v = 5, strata = state)
+
+tune_wf <- workflow() %>%
+  add_model(model_tune) %>%
+  add_formula(state~.)
+
+## Tune Model using Parallel Processing
+n_cores <- detectCores(logical = F) - 1
+my_cluster <- makeCluster(n_cores, type = "FORK")
+registerDoParallel(cl = my_cluster)
+
+tune_rf <- tune_wf %>%
+  tune_grid(resamples = fold, grid = grid,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(yardstick::accuracy, roc_auc))
+
+stopCluster(my_cluster)
+```
+
+```{r collect after tuning}
+tune_rf %>% collect_metrics()
+
+tune_rf %>% 
+  show_best(metric = "roc_auc")
+tune_rf %>% 
+  show_best(metric = "accuracy")
+
+autoplot(tune_rf)
+
+best_param <- 
+  tune_rf %>% select_best(metric = "roc_auc")
+best_param
+
+#best_param <- tibble(mtry = 2, trees = 500)
+
+rf_auc <- tune_rf %>% 
+  collect_predictions(parameters = best_param) %>% 
+  roc_curve(state, .pred_Hunting) %>% 
+  mutate(model = "Random Forest")
+
+rf_auc %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal()
+```
+
+After tuning, the best model has mtry = 3 and n_trees = 1000 , and the roc curve looks great. We can do our final fit with
+the optimized parameters.
+
+```{r Finalize with best parameters values}
+#short version, only 100 000 lignes
+tune_wf2 <- tune_wf %>% 
+  finalize_workflow(best_param)
+best_model <- tune_wf2 %>% 
+  fit(train2)
+
+#full dataset
+trip_tdr <- pengu_tdr %>% select(colnames(var_tdr_filtered))
+trip_tdr$state <- as.factor(trip_tdr$state)
+trip_tdr_split <- initial_split(trip_tdr, strata = state) #split and keep the same proportion of hunting
+trip_tdr_train <- training(trip_tdr_split)
+trip_tdr_test <- testing(trip_tdr_split)
+
+ranger_spec <-
+  rand_forest(trees = 1000, mtry = 3) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", num.threads = detectCores(logical = F) - 1)
+
+ranger_recipe_sample <-
+  recipe(formula = state ~ ., data = trip_tdr_train) %>%
+  themis::step_upsample(state)
+
+ranger_workflow_sample <-
+  workflow() %>%
+  add_recipe(ranger_recipe_sample) %>%
+  add_model(ranger_spec)
+
+model_rf <- ranger_workflow_sample %>% 
+  fit(data = trip_tdr_train)
+
+model_rf %>% extract_fit_parsnip()
+
+caret::confusionMatrix(as.factor(trip_tdr_test$state), predict(model_rf, new_data = trip_tdr_test)$.pred_class)
+best_model <- model_rf
+saveRDS(best_model, "data/Adélie_data_18-19_EM/rf_best_model.rds")
+# #Explore
+# best_model %>% extract_fit_parsnip()
+# caret::confusionMatrix(as.factor(test2$state), predict(best_model, new_data = test2)$.pred_class)
+```
+
+OOB = 0.03, accuracy  = 0.83, hunting pred value is
+0.7, and other pred value is 0.91. Overall indicators didn't changed
+much with tuning.
+
+We can check variable importance too and compare it with Boruta.
+
+```{r finale var importance}
+imp_data <- ranger_recipe_sample %>%
+  prep() %>%
+  bake(new_data = NULL)
+
+rf_imp <- ranger_spec %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(state ~ ., data = imp_data) %>%
+  vip(geom = "point")
+
+svg("figure/hunt_rf/final_var_importance.svg", height = 6, width = 10)
+rf_imp + 
+  labs_pubr() +
+  geom_point(size = 5) + 
+  scale_x_discrete(labels = c("vert_accel" = "Vertical acceleration",
+                              "roll_mean_vert_accel" = "Rolling mean of vertical acceleration",
+                              "dive_duration" = "Dive duration",
+                              "depth" = "Depth",
+                              "roll_mean_vert_speed" = "Rolling mean of vertical velocity",
+                              "roll_sd_vert_accel" = "Rolling SD of vertical acceleration"))
+dev.off()
+
+
+```
+
+The order changed a bit, especially between depth and
+roll_mean_vert_accel but the main predictors are the same
+(roll_sd_vert_accel and roll_mean_vert_speed).

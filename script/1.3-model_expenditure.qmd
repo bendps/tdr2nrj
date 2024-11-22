@@ -1,0 +1,440 @@
+---
+title: "3 - Model expenditure"
+author: "Benjamin Dupuis"
+format:
+  html: 
+    df-print: paged
+editor: visual
+theme:
+  light: flatly
+  dark: darkly
+knitr:
+  opts_knit:
+    root.dir: "/media/bdupuis/1091_PhD_BD/Research projects/tdr2nrj/"
+project:
+  execute-dir: "/media/bdupuis/1091_PhD_BD/Research projects/tdr2nrj/"
+---
+
+```{r}
+#| label: preambule
+#| echo: false
+#| include: false
+
+rm(list=ls())
+gc()
+
+options("sp_evolution_status"=2) #for rgal retirement
+
+library(tidyverse);library(viridis) 
+library(ggpubr); library(cowplot) ; library(data.table)
+library(lubridate); library(zoo); library(tools)
+library(nlme);library(lme4);library(MuMIn)
+library(report);library(broom); library(rempsyc);library(sjPlot)
+library(ggeffects); library(ggtext); library(grid)
+library(gridExtra) ; library(ggbiplot) ; library(rcompanion)
+library(Cairo) ; library(lme4) ; library(qpcR) ; library(gtsummary)
+library(Metrics)
+
+if(Sys.info()["sysname"] == "Linux"){
+  my_root <- "/media/bdupuis/1091_PhD_BD/"
+}else{ my_root <- "E:/"}
+
+source(paste0(my_root,"Data/R_functions_toolbox.R"))
+
+theme_set(theme_pubr())
+
+dlw <- read_rds("data/dlw_depth_data.rds")
+dlw$mass_init_dee <- dlw$dee/(dlw$bm_init)
+dlw_filtered <- dlw %>% filter(!is.na(mass_init_dee), !is.na(sex), mean_vedba < 1000000)
+
+#hrs instead of days for lisibility
+dlw_filtered <- dlw_filtered %>% mutate(dive_duration_hrs = dive_duration_days*24,
+                        sub_surface_duration_hrs = sub_surface_duration_days*24,
+                        deployment_duration_hrs = deployment_duration_days*24,
+                        surface_duration_hrs = surface_duration_days*24,
+                        land_duration_hrs = land_duration_days*24,
+                        bottom_duration_hrs = bottom_duration_days*24,
+                        ascent_duration_hrs = ascent_duration_days*24,
+                        descent_duration_hrs = descent_duration_days*24)
+
+#daily_lvl
+dlw_filtered <- dlw_filtered %>% mutate(daily_dive_duration_hrs = dive_duration_hrs/deployment_duration_days,
+                        daily_sub_surface_duration_hrs = sub_surface_duration_hrs/deployment_duration_days,
+                        daily_surface_duration_hrs = surface_duration_hrs/deployment_duration_days,
+                        daily_land_duration_hrs = land_duration_hrs/deployment_duration_days,
+                        daily_bottom_duration_hrs = bottom_duration_hrs/deployment_duration_days,
+                        daily_ascent_duration_hrs = ascent_duration_hrs/deployment_duration_days,
+                        daily_descent_duration_hrs = descent_duration_hrs/deployment_duration_days,
+                        daily_vert_mvt_surface_m = vert_mvt_surface_m/deployment_duration_days,
+                        daily_vert_mvt_sub_surface_m = vert_mvt_sub_surface_m/deployment_duration_days,
+                        daily_vert_mvt_dive_m = vert_mvt_dive_m/deployment_duration_days)
+```
+
+# First model
+
+DEE seems roughly normally distributed so let's start by a LMM
+
+```{r}
+hist(dlw_filtered$dee)
+
+par(mfrow = c(1, 1))
+corrplot::corrplot(cor(dlw_filtered %>% dplyr::select(daily_land_duration_hrs, daily_surface_duration_hrs, daily_dive_duration_hrs,
+                                                      daily_sub_surface_duration_hrs, daily_vert_mvt_sub_surface_m, daily_vert_mvt_surface_m, daily_vert_mvt_dive_m, bm_init)),
+                   type =  "lower", diag = F, order = "alphabet", method = "number")
+dev.off()
+
+#continue with PCA
+pc <- prcomp(dlw_filtered %>% dplyr::select(daily_land_duration_hrs, daily_surface_duration_hrs, daily_dive_duration_hrs,
+                                            daily_sub_surface_duration_hrs, daily_vert_mvt_sub_surface_m, daily_vert_mvt_surface_m, daily_vert_mvt_dive_m, bm_init), center = T, scale. = T)
+attributes(pc)
+print(pc)
+summary(pc)
+
+g <- ggbiplot(pc,
+              obs.scale = 1,
+              var.scale = 1,
+              groups = dlw_filtered$sex,
+              ellipse = TRUE,
+              circle = TRUE,
+              ellipse.prob = 0.68)
+g <- g + scale_color_discrete(name = '')
+g <- g + theme(legend.direction = 'horizontal',
+               legend.position = 'top')
+print(g)
+
+corrplot::corrplot(cor(dlw_filtered %>% dplyr::select(daily_land_duration_hrs, daily_surface_duration_hrs, daily_dive_duration_hrs,
+                                                      daily_sub_surface_duration_hrs, daily_vert_mvt_sub_surface_m, daily_vert_mvt_surface_m, daily_vert_mvt_dive_m,bm_init)),
+                   type =  "lower", diag = F, order = "alphabet", method = "number")
+
+#Test with combinations of activities ( surface + land and porpoise + dive)
+dlw_filtered <- dlw_filtered %>% mutate(daily_all_dive_duration_hrs = daily_sub_surface_duration_hrs + daily_dive_duration_hrs,
+                        daily_all_surface_duration_hrs = daily_surface_duration_hrs + daily_land_duration_hrs,
+                        daily_all_dive_mvmt_m = daily_vert_mvt_sub_surface_m, daily_vert_mvt_dive_m)
+
+#All dive
+par(mfrow = c(1, 1))
+corrplot::corrplot(cor(dlw_filtered %>% dplyr::select(daily_all_dive_duration_hrs, daily_surface_duration_hrs, daily_land_duration_hrs,bm_init)), type =  "lower", diag = F, order = "alphabet", method = "number")
+dev.off()
+
+#All surface
+par(mfrow = c(1, 1))
+corrplot::corrplot(cor(dlw_filtered %>% dplyr::select(daily_all_surface_duration_hrs, daily_sub_surface_duration_hrs, daily_dive_duration_hrs,bm_init)), type =  "lower", diag = F, order = "alphabet", method = "number")
+dev.off()
+
+#Both
+par(mfrow = c(1, 1))
+corrplot::corrplot(cor(dlw_filtered %>% dplyr::select(daily_all_surface_duration_hrs, daily_all_dive_duration_hrs,bm_init)), type =  "lower", diag = F, order = "alphabet", method = "number")
+dev.off()
+
+id_train <- unique(read_rds("data/Adélie_data_18-19_EM/rf_unbalanced_for_train.rds")$id)
+id_pred <- unique(read_rds("data/Adélie_data_18-19_EM/unknown_unbalanced_for_prediction.rds")$id)
+
+dlw_train <- dlw_filtered %>% filter(id %in% id_train)
+dlw_pred <- dlw_filtered %>% filter(id %in% id_pred)
+
+
+plot(dlw_filtered$dee, (dlw_filtered$bm_init))
+```
+
+We get a lot of variability in terms of coefficient values and variable retained depending on the train/test sampling here.
+
+Let's try bootstrap to have a more robust equation/r² and correlation. First, we do the variable selection based on the full population, then estimate the different values and their errors with bootstrap.
+
+```{r}
+#Time activity only ####
+#full model
+lm_boot_full <- lm(dee ~ daily_land_duration_hrs + daily_surface_duration_hrs + daily_dive_duration_hrs + daily_sub_surface_duration_hrs + sex + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+#combine dives
+lm_boot_dive <- lm(dee ~ daily_all_dive_duration_hrs + daily_land_duration_hrs + daily_surface_duration_hrs + sex + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+#combine surface
+lm_boot_surf <- lm(dee ~ daily_all_surface_duration_hrs + daily_dive_duration_hrs + daily_sub_surface_duration_hrs + sex + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+#combine all
+lm_boot_all <- lm(dee ~ daily_all_dive_duration_hrs + daily_all_surface_duration_hrs + sex + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+nice_table(dredge(lm_boot_full) %>% filter(`(Intercept)` < 1000)) #to filter collinearity issues
+nice_table(dredge(lm_boot_dive) %>% filter(`(Intercept)` < 1000))
+nice_table(dredge(lm_boot_surf) %>% filter(`(Intercept)` < 1000))
+nice_table(dredge(lm_boot_all) %>% filter(`(Intercept)` < 1000))
+
+#Add vertical movement ####
+lm_boot_velo_full <- lm(dee ~ daily_vert_mvt_sub_surface_m + daily_sub_surface_duration_hrs +
+                          daily_vert_mvt_surface_m + daily_surface_duration_hrs + 
+                          daily_vert_mvt_dive_m + daily_dive_duration_hrs + 
+                          daily_land_duration_hrs + sex + bm_init,
+                        data = dlw_filtered,
+                        na.action = "na.fail")
+
+lm_boot_velo_dive <- lm(dee ~ daily_all_dive_mvmt_m + daily_all_dive_duration_hrs + 
+                          daily_vert_mvt_surface_m + daily_surface_duration_hrs + 
+                          daily_land_duration_hrs + sex + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+lm_boot_velo_surf <- lm(dee ~ daily_vert_mvt_sub_surface_m + daily_sub_surface_duration_hrs +
+                          daily_vert_mvt_dive_m + daily_dive_duration_hrs + 
+                          daily_all_surface_duration_hrs + daily_vert_mvt_surface_m + sex + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+lm_boot_velo_all <- lm(dee ~ daily_all_dive_mvmt_m + daily_all_dive_duration_hrs +
+                         daily_all_surface_duration_hrs + daily_vert_mvt_surface_m + sex + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+
+nice_table(dredge(lm_boot_velo_full) %>% filter(`(Intercept)` < 1000))
+nice_table(dredge(lm_boot_velo_dive) %>% filter(`(Intercept)` < 1000))
+nice_table(dredge(lm_boot_velo_surf) %>% filter(`(Intercept)` < 1000))
+nice_table(dredge(lm_boot_velo_all) %>% filter(`(Intercept)` < 1000))
+
+# All withing 2 AICc models + best time activity + null model + vedba
+lm_best_1 <- lm(dee ~ daily_dive_duration_hrs + daily_vert_mvt_sub_surface_m + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+lm_best_2 <- lm(dee ~ daily_all_dive_duration_hrs + daily_all_dive_mvmt_m + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+lm_best_3 <- lm(dee ~ daily_dive_duration_hrs + daily_vert_mvt_dive_m + daily_vert_mvt_sub_surface_m + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+#null
+lm_best_time_null <- lm(dee ~ daily_dive_duration_hrs + daily_sub_surface_duration_hrs + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+#VEDBA
+lm_vedba <- lm(dee ~ mean_vedba + bm_init,
+               data = dlw_filtered)
+
+mod_select <- compareLM(lm_best_1, lm_best_2, lm_best_3,lm_best_time_null, lm_vedba)
+mod_select <- cbind(mod_select$Models, mod_select$Fit.criteria[,c(1,3:5)])
+delta_aic <- qpcR::akaike.weights(mod_select$AICc)
+adj.r.sqrd <- round(c(summary(lm_best_1)$adj.r.squared,
+                summary(lm_best_2)$adj.r.squared,
+                summary(lm_best_3)$adj.r.squared,
+                summary(lm_best_time_null)$adj.r.squared,
+                summary(lm_vedba)$adj.r.squared),2)
+mod_select$delta_aicc <- delta_aic$deltaAIC
+mod_select$weight <- round(delta_aic$weights, 2)
+mod_select$adj.r.sqrd <- adj.r.sqrd
+
+mod_select_print <- nice_table(mod_select)
+flextable::save_as_docx(mod_select_print, path = "figure/expenditure/mod_select_exp.docx")
+
+#Check best models diagnotics plot
+summary(lm_best_1)
+plot_model(lm_best_1, type = "diag")
+
+summary(lm_best_2)
+plot_model(lm_best_2, type = "diag")
+
+summary(lm_best_3)
+plot_model(lm_best_3, type = "diag")
+
+```
+
+Now we will bootstrap both model 1000 times by changing the train and test samples every time.
+
+```{r}
+sample_coef_intercept <- NULL
+sample_coef_dive <- NULL
+sample_coef_sub_surf <- NULL
+sample_coef_bm <- NULL
+r_sqrd <- NULL
+cor_unknow <- NULL
+pred_tibble <- NULL
+all_lm_bootstrap <- NULL
+rmse_boot <- NULL
+
+for(i in 1:1000){
+  #creating the random sample
+  id_train <- sample(1:nrow(dlw_filtered), nrow(dlw_filtered)/2, replace = F)
+  sample_d <- dlw_filtered[id_train,]
+  dlw_pred <- dlw_filtered[-id_train,]
+  
+  model_bootstrap <- lm(dee ~ daily_dive_duration_hrs + daily_vert_mvt_sub_surface_m + bm_init,
+         data = sample_d,
+         na.action = "na.fail")
+  
+  #Saving the coefficients
+  sample_coef_intercept <-
+    c(sample_coef_intercept, model_bootstrap$coefficients[1])
+  
+  sample_coef_dive <-
+    c(sample_coef_dive, model_bootstrap$coefficients[2])
+  
+  sample_coef_sub_surf <-
+    c(sample_coef_sub_surf, model_bootstrap$coefficients[3])
+  
+  sample_coef_bm <-
+    c(sample_coef_bm, model_bootstrap$coefficients[4])
+  
+  r_sqrd <-
+    c(r_sqrd, summary(model_bootstrap)$adj.r.squared)
+  
+  #predict
+  cor_unknow <- 
+    c(cor_unknow, cor(predict(model_bootstrap, dlw_pred), dlw_pred$dee))
+  
+  pred_tibble <- as_tibble(rbind(pred_tibble, cbind(dlw_dee = dlw_pred$dee, pred_dee = predict(model_bootstrap, dlw_pred), group = i, indiv = dlw_pred$id, sex = dlw_pred$sex)))
+  
+  #RMSE representing an error rate of X/mean(test.data) = Y%
+  predic <- model_bootstrap %>% predict(dlw_pred)
+  rmse_boot <-c(rmse_boot,Metrics::rmse(predic, dlw_pred$dee))
+}
+
+boot_output <- as_tibble(cbind(sample_coef_intercept, sample_coef_dive, sample_coef_sub_surf, sample_coef_bm, r_sqrd, cor_unknow, rmse_boot))
+
+sapply(boot_output, FUN = mean)
+sapply(boot_output, FUN = quantile, 0.025)
+sapply(boot_output, FUN = quantile, 0.975)
+sapply(boot_output, FUN = sd)
+
+mean(boot_output$rmse_boot)/mean(dlw_pred$dee)*100
+quantile(boot_output$rmse_boot, 0.025)/mean(dlw_pred$dee)*100
+quantile(boot_output$rmse_boot, 0.975)/mean(dlw_pred$dee)*100
+
+
+pred_tibble$dlw_dee <- as.numeric(pred_tibble$dlw_dee)
+pred_tibble$pred_dee <- as.numeric(pred_tibble$pred_dee)
+
+grp_pred_tibble <- pred_tibble %>%
+  group_by(indiv, dlw_dee, sex) %>%
+  summarise(mean_pred_dee = mean(pred_dee),
+            lwr_pred_dee = quantile(pred_dee, 0.025),
+            upr_pred_dee = quantile(pred_dee, 0.975))
+
+my_lims <- range(grp_pred_tibble$dlw_dee, grp_pred_tibble$upr_pred_dee)
+
+fitted_model <- pred_tibble %>% group_by(group) %>% do(model = lm(pred_dee ~ dlw_dee, data = .))
+new_data <- seq(min(pred_tibble$dlw_dee), max(pred_tibble$dlw_dee), by = 10)
+
+for(j in 1:1000){
+  all_lm_bootstrap <- rbind(all_lm_bootstrap, (tibble(pred_dee = unlist(predict(fitted_model$model[[j]], newdata = data.frame(dlw_dee = new_data))), dlw_dee = new_data)))
+}
+ci_bootstrap <- all_lm_bootstrap %>% group_by(dlw_dee) %>% summarise(lwr_ci = quantile(pred_dee, 0.025), upr_ci = quantile(pred_dee, 0.975))
+
+ci_ribbon <- tibble(x = ci_bootstrap$dlw_dee, ymax = ci_bootstrap$upr_ci, ymin = ci_bootstrap$lwr_ci)
+
+#check fitted model coefs 
+all_coef <- as_tibble(matrix(unlist(lapply(fitted_model$model, coef)), nrow = 1000, byrow = T))
+mean(all_coef$V1)
+mean(all_coef$V2)
+sd(all_coef$V1)
+sd(all_coef$V2)
+
+#Plots ######
+plot_boot <- ggplot() + 
+  geom_abline(slope = 1, color = "grey") +
+  stat_smooth(data = pred_tibble, geom = "line", method = "lm", aes(x = dlw_dee, y = pred_dee), se = FALSE) +
+  stat_smooth(data = ci_bootstrap, geom = "line", aes(x = dlw_dee, y = lwr_ci), method = "lm", formula = y ~ poly(x, 10), se = FALSE, linetype = "dashed") +
+  stat_smooth(data = ci_bootstrap, geom = "line", aes(x = dlw_dee, y = upr_ci), method = "lm", formula = y ~ poly(x, 10), se = FALSE, linetype = "dashed") +
+  geom_point(data = grp_pred_tibble, aes(x = dlw_dee, y = mean_pred_dee), size = 3) + 
+  geom_errorbar(data = grp_pred_tibble, aes(x = dlw_dee, ymin = lwr_pred_dee, ymax = upr_pred_dee)) + 
+  coord_cartesian(xlim = c(1500, 5000),
+                  ylim = c(1500, 5000)) +
+  scale_x_continuous(limits = my_lims) +
+  labs(x = "DLW-estimated DEE (kJ. d<sup>-1</sup>)", y = "TDR-estimated DEE (kJ. d<sup>-1</sup>)") +
+  labs_pubr() +
+  theme(axis.title.x = element_markdown(),
+        axis.title.y = element_markdown())
+
+plot_boot
+
+svg(filename = "figure/expenditure/expenditure_plot.svg", width = 6, height = 6)
+plot_boot
+dev.off()
+
+saveRDS(grp_pred_tibble, "data/expenditure_pred.rds")
+```
+
+In the end, we have 2 comparable model that performs similarly
+
+```{r}
+model_overall <- lm(dee ~ daily_dive_duration_hrs + daily_vert_mvt_sub_surface_m + bm_init,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+saveRDS(model_overall, "data/best_exp_model.rds")
+
+summary(model_overall)
+plot_model(model_overall, type = "diag")
+
+mod_summary <- tbl_regression(model_overall,
+               label = list(daily_dive_duration_hrs ~ "Time(dive)",
+                            daily_vert_mvt_sub_surface_m ~ "Vertical movement(sub-surface)",
+                            bm_init ~ "Initial body mass"),
+               intercept = T,
+               estimate_fun = function(x) mapply(format, x, scientific = abs(x) < 0.1, digits = 2)
+               ) %>% 
+  add_vif() %>% 
+  italicize_labels() %>% 
+  as_flex_table()
+mod_summary
+flextable::save_as_docx(mod_summary, path = "figure/expenditure/summary_best.docx")
+
+
+plot_sub_surf_1 <- plot(ggpredict(model_overall, terms = "daily_vert_mvt_sub_surface_m [sample=30]"), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  labs(x = "Vertical movement in subsurface phase (m.day<sup>-1</sup>)", y = "DLW-estimated DEE (kJ. d<sup>-1</sup>)", title = "A.") +
+  coord_cartesian(ylim = c(1500,4500)) +
+  theme(axis.title = element_markdown())
+
+plot_dive_1 <- plot(ggpredict(model_overall, terms = "daily_dive_duration_hrs [sample=30]"), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  labs(x = "Time spent diving (hours.day<sup>-1</sup>)", y = "DLW-estimated DEE (kJ. d<sup>-1</sup>)", title = "B.") +
+  coord_cartesian(ylim = c(1500,4500)) +
+  theme(axis.title = element_markdown())
+
+plot_bm <- plot(ggpredict(model_overall, terms = "bm_init [sample=30]"), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  labs(x = "Initial body mass (g)", y = "DLW-estimated DEE (kJ. d<sup>-1</sup>)", title = "C.") +
+  coord_cartesian(ylim = c(1500,4500)) +
+  theme(axis.title = element_markdown())
+
+svg(filename = "figure/expenditure/model_plot_best.svg", width = 6, height = 15)
+cowplot::plot_grid(plot_sub_surf_1, plot_dive_1, plot_bm, ncol = 1, nrow = 3)
+dev.off()
+
+#With masss-spec DEE
+model_mass <- lm(mass_init_dee ~ daily_dive_duration_hrs + daily_vert_mvt_sub_surface_m + sex,
+         data = dlw_filtered,
+         na.action = "na.fail")
+
+plot_sub_surf_2 <- plot(ggpredict(model_mass, terms = c( "daily_vert_mvt_sub_surface_m [sample=30]", "sex")), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  scale_color_manual(values = c("#1c87e3", "#ffbf05")) +
+  labs(x = "Vertical movement in subsurface phase (m.day<sup>-1</sup>)", y = "DLW-estimated mass-specific DEE (kJ. g<sup>-1</sup>. day<sup>-1</sup>)", title = "A.") +
+  #coord_cartesian(ylim = c(1500,4500)) +
+  theme(axis.title = element_markdown())
+
+plot_dive_2 <- plot(ggpredict(model_mass, terms = c("daily_dive_duration_hrs [sample=30]", "sex")), show_residuals = T, ci_style = "dash", dot_alpha = 1, dot_size = 3) +
+  theme_pubr() + 
+  labs_pubr() +
+  scale_color_manual(values = c("#1c87e3", "#ffbf05")) +
+  labs(x = "Time spent diving (hours.day<sup>-1</sup>)", y = "DLW-estimated mass-specific DEE (kJ. g<sup>-1</sup>. day<sup>-1</sup>)", title = "B.") +
+  #coord_cartesian(ylim = c(1500,4500)) +
+  theme(axis.title = element_markdown())
+
+svg(filename = "figure/expenditure/model_plot_best_mass.svg", width = 6, height = 10)
+cowplot::plot_grid(plot_sub_surf_2, plot_dive_2, ncol = 1, nrow = 2)
+dev.off()
+```
