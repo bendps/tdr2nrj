@@ -8,6 +8,6 @@ All scripts are ordered to follow results presented in the paper :
 - 1.1 to 1.3 correspond to "Energy expenditure estimation" section of the results
 - 2.1 to 2.4 correspond to "Random forest analysis for detecting feeding activity" section
 - 2.5 corresponds to "Feeding activity estimation and comparison with historical proxies"
-- 3 corresponds to at-sea energetics of Adélie penguins.
+- 3 corresponds to "At-sea energetics of Adélie penguins"
 
 For further info, contact benjamin.dupuis@ens-lyon.org
